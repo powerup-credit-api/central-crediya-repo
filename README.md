@@ -48,7 +48,7 @@ CrediYa lets users register, authenticate, submit loan requests and have them de
 | **Authentication** | [powerup-credit-api/Autenticacion](https://github.com/powerup-credit-api/Autenticacion) | Java 21, WebFlux, R2DBC MySQL | Users, roles, login, JWT issuance, base salary lookup |
 | **Loan Requests** | [powerup-credit-api/Solicitudes](https://github.com/powerup-credit-api/Solicitudes) | Java 21, WebFlux, R2DBC MySQL, SQS | Submission, listing, status changes and event publishing |
 | **Reports** | [powerup-credit-api/Reportes](https://github.com/powerup-credit-api/Reportes) | Java 21, WebFlux, DynamoDB, SQS | Approved-request metrics and scheduled daily report |
-| **API Gateway (Spring)** | [powerup-credit-api/ApiGateway](https://github.com/powerup-credit-api/ApiGateway) | Spring Cloud Gateway | Internal routing and JWT validation inside the cluster |
+| **API Gateway (Spring) · local only** | [powerup-credit-api/ApiGateway](https://github.com/powerup-credit-api/ApiGateway) | Spring Cloud Gateway | Routing and JWT validation in the Docker Compose environment. **Not deployed to AWS**, where Amazon API Gateway + ALB take its place |
 | **Databases** | [powerup-credit-api/Bases_de_datos](https://github.com/powerup-credit-api/Bases_de_datos) | MySQL 8 + `init.sql` | Images and initialization scripts for local development |
 | **Lambda · debt capacity** | [powerup-credit-api/Lambda_endeudamiento](https://github.com/powerup-credit-api/Lambda_endeudamiento) | Node.js, SQS, SES | Automatic decision and payment plan |
 | **Lambda · emails** | [powerup-credit-api/Email-Lambda](https://github.com/powerup-credit-api/Email-Lambda) | Node.js, SQS, SES | Decision notification to the applicant |
@@ -70,16 +70,14 @@ flowchart LR
     LP -->|X-USER-SUBJECT<br/>X-USER-ROLE| ALB[Application Load Balancer]
 
     subgraph ECS[Amazon ECS · service namespace]
-        GW[Spring Cloud Gateway]
         AUTH[Authentication]
         SOL[Loan Requests]
         REP[Reports]
-        GW --> AUTH
-        GW --> SOL
-        GW --> REP
         SOL -->|validate user<br/>and salary| AUTH
     end
-    ALB --> GW
+    ALB -->|path-based routing| AUTH
+    ALB -->|path-based routing| SOL
+    ALB -->|path-based routing| REP
 
     ECR[(Amazon ECR<br/>images)] -.-> ECS
     SM -.->|injected secrets| ECS
@@ -106,7 +104,7 @@ flowchart LR
 
 **Quick read**
 
-- **Entry:** all traffic goes through Amazon API Gateway, which validates the JWT with a Lambda Authorizer (the secret lives in Secrets Manager) and forwards the request, enriched with `X-USER-SUBJECT` and `X-USER-ROLE`, to the Application Load Balancer.
+- **Entry:** all traffic goes through Amazon API Gateway, which validates the JWT with a Lambda Authorizer (the secret lives in Secrets Manager) and forwards the request, enriched with `X-USER-SUBJECT` and `X-USER-ROLE`, to the Application Load Balancer, which routes it by path straight to the right microservice. The Spring Cloud Gateway from the [ApiGateway](https://github.com/powerup-credit-api/ApiGateway) repository is **not part of the AWS deployment**: Amazon API Gateway, the Lambdas and the ALB cover its routing and authentication role. It is only used in the local Docker Compose setup.
 - **Compute:** microservices run as containers on **ECS**, with images stored in **ECR**. They talk to each other by name through a **service discovery namespace**, with no ports exposed to the outside.
 - **Asynchrony:** work that doesn't need an immediate response (automatic decision, emails, metrics) travels as events over **SQS** and is handled by Lambdas or by consumers inside the services.
 - **Secrets and permissions:** sensitive values are managed in **Secrets Manager** and every component uses its own IAM role with least privilege (see [§10](#10-aws-deployment)).
@@ -212,7 +210,7 @@ Service listeners use *long polling* (20 s, up to 10 messages) and delete a mess
 
 ## 6. API: endpoints and roles
 
-All routes are exposed through the API Gateway. Except for login, they require `Authorization: Bearer <token>`.
+All routes are exposed through the API Gateway (Amazon API Gateway in AWS, the Spring Cloud Gateway locally). Except for login, they require `Authorization: Bearer <token>`.
 
 | Method | Path | Service | Allowed roles | Description |
 |---|---|---|---|---|
@@ -293,7 +291,7 @@ Creation scripts and seed data live in [Bases_de_datos](https://github.com/power
 
 ## 9. Local execution (Docker Compose)
 
-The solution started locally. The `docker-compose.yml` in this repository brings up **Authentication, Loan Requests, the Gateway and both MySQL databases** on an internal network.
+The solution started locally. The `docker-compose.yml` in this repository brings up **Authentication, Loan Requests, the Spring Cloud Gateway and both MySQL databases** on an internal network. Here the Gateway plays the role that Amazon API Gateway, the Lambdas and the ALB play in AWS.
 
 ### Prerequisites
 
@@ -322,7 +320,7 @@ docker-compose up --build
 
 | Service | Local URL |
 |---|---|
-| API Gateway | http://localhost:8080 |
+| Spring Cloud Gateway (local only) | http://localhost:8080 |
 | Loan Requests | http://localhost:8081 |
 | Authentication | http://localhost:8082 |
 | Reports | http://localhost:8083 (see note) |
@@ -342,7 +340,7 @@ docker-compose up --build
 | **ECR** | One repository per microservice; stores the images built from each `Dockerfile`. |
 | **ECS** | Runs the containers. One task definition and one service per microservice. |
 | **Service namespace (Cloud Map)** | Internal discovery: Loan Requests calls Authentication by service name, not by IP. |
-| **Application Load Balancer** | Cluster entry point; forwards to the Spring Cloud Gateway. |
+| **Application Load Balancer** | Cluster entry point; routes requests by path to the target group of each microservice. |
 | **Amazon API Gateway** | Public entry to the API. Integrates the Lambda Authorizer and the Lambda Proxy. |
 | **Lambda** | Authorizer, proxy, automatic decision, emails and daily report. |
 | **SQS** | Messaging between services and Lambdas (see [§5](#5-sqs-queues)). |
@@ -358,7 +356,7 @@ Region: **`us-east-2`**.
 ```bash
 AWS_REGION=us-east-2
 ACCOUNT_ID=<your-account-id>
-REPO=solicitudes        # autenticacion | solicitudes | reportes | api-gateway
+REPO=solicitudes        # autenticacion | solicitudes | reportes
 
 aws ecr get-login-password --region $AWS_REGION \
   | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
@@ -377,12 +375,12 @@ Locally, secrets are plain environment variables in the compose file. In AWS, no
 | Secret | Where it lives | Who consumes it | How |
 |---|---|---|---|
 | `jwt/secret` (`JWT_SECRET`) | Secrets Manager | Lambda Authorizer, Lambda Proxy | Read at runtime with `GetSecretValue` and cached in memory between invocations |
-| `JWT_SECRET` | Secrets Manager | Authentication, Loan Requests, Reports, Gateway | Injected into the ECS task definition as a *secret*, so it reaches the container as an environment variable |
+| `JWT_SECRET` | Secrets Manager | Authentication, Loan Requests, Reports | Injected into the ECS task definition as a *secret*, so it reaches the container as an environment variable |
 | Database credentials (`MYSQL_USER`, `MYSQL_PASSWORD`) | Secrets Manager | Authentication, Loan Requests | Injected into the ECS task definition as secrets |
 
 Key points:
 
-- The **same JWT secret** signs tokens in Authentication and validates them in the Lambdas and in the Gateway, so it has a single source of truth and can be rotated in one place.
+- The **same JWT secret** signs tokens in Authentication and validates them in the Lambdas and in the services, so it has a single source of truth and can be rotated in one place.
 - The ECS **execution role** is allowed `secretsmanager:GetSecretValue` only on the secrets its tasks need.
 - Non-sensitive configuration (queue URLs, ports, region, cron) stays as plain environment variables in the task definition.
 
@@ -399,7 +397,7 @@ Roles are split by responsibility, following least privilege:
 | **Role · Email / daily-report Lambdas** | Read their queue and `ses:SendEmail` |
 | **Role · Lambda Authorizer / Proxy** | `secretsmanager:GetSecretValue` on `jwt/secret` |
 
-In addition, security groups only allow the ALB to reach the Gateway and the Gateway to reach the services, and the databases only accept traffic from the ECS tasks.
+In addition, security groups only allow the ALB to reach the services, and the databases only accept traffic from the ECS tasks.
 
 ### 10.5 Suggested order to reproduce the deployment
 
@@ -408,7 +406,7 @@ In addition, security groups only allow the ALB to reach the Gateway and the Gat
 3. Create the secrets in Secrets Manager (`jwt/secret` and database credentials).
 4. Deploy the three business Lambdas and attach them as triggers of their queues.
 5. Create the ECR repositories, push the images and register task definitions and services in ECS inside the namespace.
-6. Create the ALB and point it to the Gateway.
+6. Create the ALB with path-based listener rules, one target group per microservice.
 7. Create the API Gateway with the Lambda Authorizer and the Lambda Proxy toward the ALB.
 
 ---
@@ -417,7 +415,7 @@ In addition, security groups only allow the ALB to reach the Gateway and the Gat
 
 | Variable | Service | Description |
 |---|---|---|
-| `JWT_SECRET` | Authentication, Loan Requests, Reports, Gateway | Shared HMAC secret to sign and validate the JWT |
+| `JWT_SECRET` | Authentication, Loan Requests, Reports, Gateway (local) | Shared HMAC secret to sign and validate the JWT |
 | `JWT_EXPIRATION` | Authentication | Token lifetime in ms (default `3600000`) |
 | `MYSQL_HOST` · `MYSQL_PORT` · `MYSQL_DATABASE` · `MYSQL_USER` · `MYSQL_PASSWORD` · `MYSQL_SSL_ENABLED` | Authentication, Loan Requests | R2DBC connection |
 | `USUARIO_API_URL` | Loan Requests | Base URL of the Authentication service |
@@ -427,8 +425,8 @@ In addition, security groups only allow the ALB to reach the Gateway and the Gat
 | `AWS_SQS_SOLICITUD_APROBADA` | Loan Requests, Reports | URL of `SolicitudAprobadaQueue` |
 | `AWS_SQS_REPORTE_DIARIO` | Reports | URL of `ReporteDiarioQueue` |
 | `REPORT_CRON` | Reports | Cron expression (Spring 6-field format) for the daily report |
-| `SERVICES_AUTH_URI` · `SERVICES_SOLICITUDES_URI` · `SERVICES_REPORTES_URI` | Gateway | Internal URIs of each service |
-| `SERVICES_AUTH_PUBLIC_PATHS` · `SERVICES_AUTH_PRIVATE_PATHS` · `SERVICES_SOLICITUDES_PATHS` · `SERVICES_REPORTES_PRIVATE_PATHS` | Gateway | Paths exposed per service |
+| `SERVICES_AUTH_URI` · `SERVICES_SOLICITUDES_URI` · `SERVICES_REPORTES_URI` | Gateway (local only) | Internal URIs of each service |
+| `SERVICES_AUTH_PUBLIC_PATHS` · `SERVICES_AUTH_PRIVATE_PATHS` · `SERVICES_SOLICITUDES_PATHS` · `SERVICES_REPORTES_PRIVATE_PATHS` | Gateway (local only) | Paths exposed per service |
 | `SES_FROM_EMAIL` | Email Lambdas | Verified sender in SES |
 | `REPORTE_TO_EMAIL` | Daily-report Lambda | Recipient of the summary |
 | `RESULTADOS_QUEUE_URL` | Debt-capacity Lambda | Queue where it publishes the decision |
@@ -449,7 +447,7 @@ In addition, security groups only allow the ALB to reach the Gateway and the Gat
 ## 13. Tech stack
 
 - **Languages:** Java 21 · Node.js (Lambdas)
-- **Frameworks:** Spring Boot 3.5 · Spring WebFlux · Spring Security · Spring Cloud Gateway · Project Reactor
+- **Frameworks:** Spring Boot 3.5 · Spring WebFlux · Spring Security · Spring Cloud Gateway (local) · Project Reactor
 - **Persistence:** MySQL 8 (R2DBC) · Amazon DynamoDB
 - **Messaging and email:** Amazon SQS · Amazon SES
 - **Containers and cloud:** Docker · Amazon ECR · Amazon ECS · API Gateway · Lambda · IAM · Secrets Manager · CloudWatch
