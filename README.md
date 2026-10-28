@@ -459,4 +459,4 @@ In addition, security groups only allow the ALB to reach the services, and the d
 ## Credits
 
 Project developed as part of the **PowerUp Bootcamp by Pragma**.
-Author: _add your name and contact links here_.
+Author: Cristian Hernández.
